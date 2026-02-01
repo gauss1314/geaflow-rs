@@ -739,6 +739,7 @@ struct RegisterDatasetRequest {
     dataset_id: String,
     properties_path: String,
     vertex_path: Option<String>,
+    edge_path: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -817,6 +818,9 @@ async fn handle_register_dataset(state: Arc<AppState>, req: &HttpRequest) -> Htt
     };
     if let Some(vp) = payload.vertex_path.as_ref() {
         meta.vertex_file = PathBuf::from(vp);
+    }
+    if let Some(ep) = payload.edge_path.as_ref() {
+        meta.edge_file = PathBuf::from(ep);
     }
     if !meta.vertex_file.exists() {
         return text_response(
