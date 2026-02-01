@@ -62,6 +62,11 @@ pub enum DriverToWorker {
         vertices: Vec<(Vec<u8>, Vec<u8>)>,
         edges: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     },
+    LoadGraphBatch {
+        vertices: Vec<(Vec<u8>, Vec<u8>)>,
+        edges: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        last: bool,
+    },
     SetAlgorithm {
         name: String,
         iterations: u64,
@@ -83,12 +88,18 @@ pub enum DriverToWorker {
         checkpoint_dir: String,
     },
     FetchVertices,
+    DumpVerticesCsv {
+        output_path: String,
+    },
     Shutdown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerToDriver {
     Ready,
+    GraphLoaded {
+        last: bool,
+    },
     SuperstepResult {
         iteration: u64,
         outbox: Vec<(Vec<u8>, Vec<u8>)>,
@@ -102,6 +113,9 @@ pub enum WorkerToDriver {
     CheckpointLoaded,
     Vertices {
         vertices: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    VerticesDumped {
+        output_path: String,
     },
     Error {
         message: String,

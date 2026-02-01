@@ -3,12 +3,13 @@ use geaflow_common::error::{GeaFlowError, GeaFlowResult};
 use geaflow_common::types::{Edge, Vertex};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
-use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const CF_VERTICES: &str = "vertices";
 const CF_EDGES: &str = "edges";
+static EDGE_BATCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct RocksDbGraphState {
@@ -52,6 +53,44 @@ impl RocksDbGraphState {
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> GeaFlowResult<T> {
         bincode::deserialize(bytes)
             .map_err(|e| GeaFlowError::Internal(format!("bincode decode: {e}")))
+    }
+
+    pub fn dump_vertices_csv_u64_u64(&self, output_path: impl AsRef<Path>) -> GeaFlowResult<()> {
+        let cf = self.cf(CF_VERTICES)?;
+        let mut f = std::fs::File::create(output_path.as_ref()).map_err(GeaFlowError::Io)?;
+        use std::io::Write;
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for kv in iter {
+            let (k, v) = kv.map_err(|e| GeaFlowError::Internal(format!("rocksdb iter: {e}")))?;
+            let id_bytes: Vec<u8> = Self::decode(&k)?;
+            let value_bytes: Vec<u8> = Self::decode(&v)?;
+            let id: u64 = bincode::deserialize(&id_bytes)
+                .map_err(|e| GeaFlowError::Internal(format!("decode id: {e}")))?;
+            let value: u64 = bincode::deserialize(&value_bytes)
+                .map_err(|e| GeaFlowError::Internal(format!("decode value: {e}")))?;
+            writeln!(&mut f, "{id},{value}")
+                .map_err(|e| GeaFlowError::Internal(format!("write csv: {e}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn dump_vertices_csv_u64_f64(&self, output_path: impl AsRef<Path>) -> GeaFlowResult<()> {
+        let cf = self.cf(CF_VERTICES)?;
+        let mut f = std::fs::File::create(output_path.as_ref()).map_err(GeaFlowError::Io)?;
+        use std::io::Write;
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for kv in iter {
+            let (k, v) = kv.map_err(|e| GeaFlowError::Internal(format!("rocksdb iter: {e}")))?;
+            let id_bytes: Vec<u8> = Self::decode(&k)?;
+            let value_bytes: Vec<u8> = Self::decode(&v)?;
+            let id: u64 = bincode::deserialize(&id_bytes)
+                .map_err(|e| GeaFlowError::Internal(format!("decode id: {e}")))?;
+            let value: f64 = bincode::deserialize(&value_bytes)
+                .map_err(|e| GeaFlowError::Internal(format!("decode value: {e}")))?;
+            writeln!(&mut f, "{id},{value}")
+                .map_err(|e| GeaFlowError::Internal(format!("write csv: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -111,23 +150,13 @@ where
 
     fn put_edge_batch(&self, edges: &[Edge<K, EV>]) -> GeaFlowResult<()> {
         let cf = self.cf(CF_EDGES)?;
-
-        let mut grouped: HashMap<K, Vec<Edge<K, EV>>> = HashMap::new();
-        for e in edges {
-            grouped.entry(e.src_id.clone()).or_default().push(e.clone());
-        }
-
+        let nonce = EDGE_BATCH_NONCE.fetch_add(1, Ordering::Relaxed);
         let mut batch = WriteBatch::default();
-        for (src, mut src_edges) in grouped {
-            let key = Self::encode(&src)?;
-            let mut existing: Vec<Edge<K, EV>> = match self.db.get_cf(cf, &key) {
-                Ok(Some(bytes)) => Self::decode(&bytes)?,
-                Ok(None) => Vec::new(),
-                Err(e) => return Err(GeaFlowError::Internal(format!("rocksdb get edges: {e}"))),
-            };
-
-            existing.append(&mut src_edges);
-            batch.put_cf(cf, key, Self::encode(&existing)?);
+        for (i, e) in edges.iter().enumerate() {
+            let mut key = Self::encode(&e.src_id)?;
+            key.extend_from_slice(&nonce.to_le_bytes());
+            key.extend_from_slice(&(i as u32).to_le_bytes());
+            batch.put_cf(cf, key, Self::encode(e)?);
         }
 
         self.db
@@ -138,14 +167,19 @@ where
 
     fn get_out_edges(&self, src_id: &K) -> GeaFlowResult<Vec<Edge<K, EV>>> {
         let cf = self.cf(CF_EDGES)?;
-        let key = Self::encode(src_id)?;
-        let v = self
+        let prefix = Self::encode(src_id)?;
+        let iter = self
             .db
-            .get_cf(cf, key)
-            .map_err(|e| GeaFlowError::Internal(format!("rocksdb get edges: {e}")))?;
-        match v {
-            None => Ok(Vec::new()),
-            Some(bytes) => Ok(Self::decode(&bytes)?),
+            .iterator_cf(cf, IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+        let mut out = Vec::new();
+        for kv in iter {
+            let (k, v) = kv.map_err(|e| GeaFlowError::Internal(format!("rocksdb iter: {e}")))?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            let e: Edge<K, EV> = Self::decode(&v)?;
+            out.push(e);
         }
+        Ok(out)
     }
 }
