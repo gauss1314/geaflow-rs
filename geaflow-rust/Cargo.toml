@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "geaflow-api",
+    "geaflow-common",
+    "geaflow-runtime",
+]
+resolver = "2"

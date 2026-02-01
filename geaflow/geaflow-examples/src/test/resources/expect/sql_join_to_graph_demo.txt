@@ -1,8 +1,0 @@
-jim,jim
-kate,kate
-lily,lily
-lucy,lucy
-jim,jim
-lucy,lucy
-lucy,lucy
-jack,jack

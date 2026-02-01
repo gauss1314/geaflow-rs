@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  master:
+    image: rust:1.77
+    working_dir: /workspace/geaflow-rust
+    volumes:
+      - ../..:/workspace
+    command: >
+      bash -lc "cargo run -p geaflow-runtime --bin geaflow-master -- --listen 0.0.0.0:7000 --http-listen 0.0.0.0:17000"
+    ports:
+      - "7000:7000"
+      - "17000:17000"
+
+  driver:
+    image: rust:1.77
+    working_dir: /workspace/geaflow-rust
+    volumes:
+      - ../..:/workspace
+    command: >
+      bash -lc "cargo run -p geaflow-runtime --bin geaflow-driver -- --listen 0.0.0.0:7100 --master master:7000 --http-listen 0.0.0.0:17100"
+    depends_on:
+      - master
+    ports:
+      - "7100:7100"
+      - "17100:17100"
+
+  worker1:
+    image: rust:1.77
+    working_dir: /workspace/geaflow-rust
+    volumes:
+      - ../..:/workspace
+      - worker1_state:/tmp/geaflow-worker-1
+    command: >
+      bash -lc "cargo run -p geaflow-runtime --bin geaflow-worker -- --listen 0.0.0.0:9001 --state-dir /tmp/geaflow-worker-1 --master master:7000"
+    depends_on:
+      - master
+    ports:
+      - "9001:9001"
+
+  worker2:
+    image: rust:1.77
+    working_dir: /workspace/geaflow-rust
+    volumes:
+      - ../..:/workspace
+      - worker2_state:/tmp/geaflow-worker-2
+    command: >
+      bash -lc "cargo run -p geaflow-runtime --bin geaflow-worker -- --listen 0.0.0.0:9002 --state-dir /tmp/geaflow-worker-2 --master master:7000"
+    depends_on:
+      - master
+    ports:
+      - "9002:9002"
+
+volumes:
+  worker1_state:
+  worker2_state:
+

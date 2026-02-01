@@ -1,0 +1,9 @@
+[package]
+name = "geaflow-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+geaflow-common = { path = "../geaflow-common" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }

@@ -1,5 +1,0 @@
-Bob|30|Los Angeles|metrics
-Alen|20|Zhe Jiang|yellow
-John|25|null|null
-Bush|11|Zhe Jiang|null
-Ray|null|null|null
