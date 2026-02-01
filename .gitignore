@@ -131,3 +131,6 @@ geaflow-console/app/bootstrap/src/main/resources/public
 
 # vs code
 .vscode
+
+graph500-test/
+.trae/
