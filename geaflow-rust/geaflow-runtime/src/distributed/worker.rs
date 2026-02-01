@@ -67,6 +67,37 @@ pub async fn run_worker(config: WorkerConfig) -> GeaFlowResult<()> {
                     &state, &e,
                 )?;
             }
+            DriverToWorker::LoadGraphBatch {
+                vertices,
+                edges,
+                last,
+            } => {
+                if !vertices.is_empty() {
+                    let v: Vec<Vertex<Vec<u8>, Vec<u8>>> = vertices
+                        .into_iter()
+                        .map(|(id, value)| Vertex { id, value })
+                        .collect();
+                    <RocksDbGraphState as GraphState<Vec<u8>, Vec<u8>, Vec<u8>>>::put_vertex_batch(
+                        &state, &v,
+                    )?;
+                }
+
+                if !edges.is_empty() {
+                    let e: Vec<Edge<Vec<u8>, Vec<u8>>> = edges
+                        .into_iter()
+                        .map(|(src, target, value)| Edge {
+                            src_id: src,
+                            target_id: target,
+                            value,
+                        })
+                        .collect();
+                    <RocksDbGraphState as GraphState<Vec<u8>, Vec<u8>, Vec<u8>>>::put_edge_batch(
+                        &state, &e,
+                    )?;
+                }
+
+                send_msg(&mut framed, &WorkerToDriver::GraphLoaded { last }).await?;
+            }
             DriverToWorker::SetAlgorithm {
                 name,
                 iterations,
@@ -157,6 +188,28 @@ pub async fn run_worker(config: WorkerConfig) -> GeaFlowResult<()> {
                 let vertices: Vec<(Vec<u8>, Vec<u8>)> =
                     vertices.into_iter().map(|v| (v.id, v.value)).collect();
                 send_msg(&mut framed, &WorkerToDriver::Vertices { vertices }).await?;
+            }
+            DriverToWorker::DumpVerticesCsv { output_path } => {
+                let algo_name = algorithm.as_ref().map(|a| a.name()).unwrap_or("unknown");
+                let dump_result = match algo_name {
+                    "wcc" => state.dump_vertices_csv_u64_u64(Path::new(&output_path)),
+                    "pagerank" => state.dump_vertices_csv_u64_f64(Path::new(&output_path)),
+                    other => Err(GeaFlowError::InvalidArgument(format!(
+                        "unsupported algorithm for dump: {other}"
+                    ))),
+                };
+
+                if let Err(e) = dump_result {
+                    send_msg(
+                        &mut framed,
+                        &WorkerToDriver::Error {
+                            message: format!("{e}"),
+                        },
+                    )
+                    .await?;
+                } else {
+                    send_msg(&mut framed, &WorkerToDriver::VerticesDumped { output_path }).await?;
+                }
             }
             DriverToWorker::Shutdown => {
                 break;

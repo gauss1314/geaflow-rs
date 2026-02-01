@@ -99,11 +99,16 @@ pub struct PageRankParams {
 pub struct PageRankAlgorithm {
     iterations: u64,
     alpha: f64,
+    teleport: Option<f64>,
 }
 
 impl PageRankAlgorithm {
     pub fn new(iterations: u64, alpha: f64) -> Self {
-        Self { iterations, alpha }
+        Self {
+            iterations,
+            alpha,
+            teleport: None,
+        }
     }
 
     pub fn from_params(iterations: u64, params: &[u8]) -> GeaFlowResult<Self> {
@@ -131,6 +136,9 @@ impl DistributedAlgorithm for PageRankAlgorithm {
     ) -> ComputeResult {
         let out_degree = out_edges.len() as f64;
         let vertex_value: f64 = vertex_value.map(decode).transpose()?.unwrap_or(0.0);
+        if self.teleport.is_none() && vertex_value > 0.0 {
+            self.teleport = Some((1.0 - self.alpha) * vertex_value);
+        }
 
         if iteration == 1 {
             if out_degree > 0.0 {
@@ -149,7 +157,7 @@ impl DistributedAlgorithm for PageRankAlgorithm {
             let v: f64 = decode(m)?;
             sum += v;
         }
-        let pr = sum * self.alpha + (1.0 - self.alpha);
+        let pr = sum * self.alpha + self.teleport.unwrap_or(1.0 - self.alpha);
 
         let mut out = Vec::new();
         if out_degree > 0.0 {

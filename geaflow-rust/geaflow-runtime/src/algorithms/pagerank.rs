@@ -17,6 +17,7 @@ impl PageRankAlgorithm {
 #[derive(Clone)]
 pub struct PageRankFunction {
     alpha: f64,
+    teleport: Option<f64>,
 }
 
 impl VertexCentricComputeFunction<u64, f64, u8, f64> for PageRankFunction {
@@ -29,6 +30,9 @@ impl VertexCentricComputeFunction<u64, f64, u8, f64> for PageRankFunction {
         let vertex_value = context.vertex_value().cloned().unwrap_or(0.0);
         let edges: Vec<_> = context.edges().cloned().collect();
         let out_degree = edges.len() as f64;
+        if self.teleport.is_none() && vertex_value > 0.0 {
+            self.teleport = Some((1.0 - self.alpha) * vertex_value);
+        }
 
         if context.iteration() == 1 {
             if out_degree > 0.0 {
@@ -44,7 +48,7 @@ impl VertexCentricComputeFunction<u64, f64, u8, f64> for PageRankFunction {
         for m in message_iterator {
             sum += m;
         }
-        let pr = sum * self.alpha + (1.0 - self.alpha);
+        let pr = sum * self.alpha + self.teleport.unwrap_or(1.0 - self.alpha);
         context.set_new_vertex_value(pr);
 
         if out_degree > 0.0 {
@@ -66,6 +70,9 @@ impl VertexCentricComputeAlgorithm<u64, f64, u8, f64> for PageRankAlgorithm {
     }
 
     fn create_function(&self) -> Box<dyn VertexCentricComputeFunction<u64, f64, u8, f64>> {
-        Box::new(PageRankFunction { alpha: self.alpha })
+        Box::new(PageRankFunction {
+            alpha: self.alpha,
+            teleport: None,
+        })
     }
 }

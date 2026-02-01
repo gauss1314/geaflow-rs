@@ -4,6 +4,7 @@ use crate::distributed::protocol::{
 use crate::shuffle::MessageShuffle;
 use geaflow_common::error::{GeaFlowError, GeaFlowResult};
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::Path;
 use tokio::net::TcpStream;
@@ -258,6 +259,287 @@ impl DistributedDriver {
             .await?;
         }
         Ok(())
+    }
+
+    pub async fn load_graph_batch(
+        &mut self,
+        worker_index: usize,
+        vertices: Vec<(Vec<u8>, Vec<u8>)>,
+        edges: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+        last: bool,
+    ) -> GeaFlowResult<()> {
+        let worker = self
+            .workers
+            .get_mut(worker_index)
+            .ok_or_else(|| GeaFlowError::InvalidArgument("bad worker index".to_string()))?;
+        send_msg(
+            worker,
+            &DriverToWorker::LoadGraphBatch {
+                vertices,
+                edges,
+                last,
+            },
+        )
+        .await?;
+        let ack: WorkerToDriver = recv_msg(worker).await?;
+        match ack {
+            WorkerToDriver::GraphLoaded { .. } => Ok(()),
+            WorkerToDriver::Error { message } => {
+                Err(GeaFlowError::Internal(format!("worker error: {message}")))
+            }
+            other => Err(GeaFlowError::Internal(format!(
+                "unexpected graph load ack: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn load_graph500_streaming<F>(
+        &mut self,
+        vertices_path: impl AsRef<Path>,
+        edges_path: impl AsRef<Path>,
+        mut vertex_value: F,
+        vertex_batch_size: usize,
+        edge_batch_size: usize,
+        undirected: bool,
+    ) -> GeaFlowResult<()>
+    where
+        F: FnMut(u64) -> Vec<u8>,
+    {
+        let n = self.worker_count().max(1);
+        let mut v_bufs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = (0..n).map(|_| Vec::new()).collect();
+        let mut e_bufs: Vec<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> =
+            (0..n).map(|_| Vec::new()).collect();
+
+        let vertices_f = std::fs::File::open(vertices_path.as_ref())
+            .map_err(|e| GeaFlowError::Internal(format!("open vertices: {e}")))?;
+        let vertices_r = std::io::BufReader::new(vertices_f);
+        for line in vertices_r.lines() {
+            let line = line.map_err(|e| GeaFlowError::Internal(format!("read vertices: {e}")))?;
+            let s = line.trim();
+            if s.is_empty() || s.starts_with('#') {
+                continue;
+            }
+            let mut it = s.split_whitespace();
+            let id: u64 = it
+                .next()
+                .ok_or_else(|| GeaFlowError::InvalidArgument("vertex id missing".to_string()))?
+                .parse()
+                .map_err(|e| GeaFlowError::InvalidArgument(format!("vertex id parse: {e}")))?;
+            let id_bytes = bincode::serialize(&id)
+                .map_err(|e| GeaFlowError::Internal(format!("encode vertex id: {e}")))?;
+            let value_bytes = vertex_value(id);
+            let p = partition_of(&id_bytes, n);
+            v_bufs[p].push((id_bytes, value_bytes));
+            if v_bufs[p].len() >= vertex_batch_size.max(1) {
+                self.load_graph_batch(p, std::mem::take(&mut v_bufs[p]), Vec::new(), false)
+                    .await?;
+            }
+        }
+
+        for p in 0..n {
+            if !v_bufs[p].is_empty() {
+                self.load_graph_batch(p, std::mem::take(&mut v_bufs[p]), Vec::new(), false)
+                    .await?;
+            }
+        }
+
+        let edges_f = std::fs::File::open(edges_path.as_ref())
+            .map_err(|e| GeaFlowError::Internal(format!("open edges: {e}")))?;
+        let edges_r = std::io::BufReader::new(edges_f);
+        let edge_value_bytes = bincode::serialize(&0u8)
+            .map_err(|e| GeaFlowError::Internal(format!("encode edge value: {e}")))?;
+        for line in edges_r.lines() {
+            let line = line.map_err(|e| GeaFlowError::Internal(format!("read edges: {e}")))?;
+            let s = line.trim();
+            if s.is_empty() || s.starts_with('#') {
+                continue;
+            }
+            let mut it = s.split_whitespace();
+            let src: u64 = it
+                .next()
+                .ok_or_else(|| GeaFlowError::InvalidArgument("edge src missing".to_string()))?
+                .parse()
+                .map_err(|e| GeaFlowError::InvalidArgument(format!("edge src parse: {e}")))?;
+            let dst: u64 = it
+                .next()
+                .ok_or_else(|| GeaFlowError::InvalidArgument("edge dst missing".to_string()))?
+                .parse()
+                .map_err(|e| GeaFlowError::InvalidArgument(format!("edge dst parse: {e}")))?;
+            let src_bytes = bincode::serialize(&src)
+                .map_err(|e| GeaFlowError::Internal(format!("encode edge src: {e}")))?;
+            let dst_bytes = bincode::serialize(&dst)
+                .map_err(|e| GeaFlowError::Internal(format!("encode edge dst: {e}")))?;
+            {
+                let p = partition_of(&src_bytes, n);
+                e_bufs[p].push((
+                    src_bytes.clone(),
+                    dst_bytes.clone(),
+                    edge_value_bytes.clone(),
+                ));
+                if e_bufs[p].len() >= edge_batch_size.max(1) {
+                    self.load_graph_batch(p, Vec::new(), std::mem::take(&mut e_bufs[p]), false)
+                        .await?;
+                }
+            }
+            if undirected {
+                let p = partition_of(&dst_bytes, n);
+                e_bufs[p].push((dst_bytes, src_bytes, edge_value_bytes.clone()));
+                if e_bufs[p].len() >= edge_batch_size.max(1) {
+                    self.load_graph_batch(p, Vec::new(), std::mem::take(&mut e_bufs[p]), false)
+                        .await?;
+                }
+            }
+        }
+
+        for p in 0..n {
+            if !e_bufs[p].is_empty() {
+                self.load_graph_batch(p, Vec::new(), std::mem::take(&mut e_bufs[p]), false)
+                    .await?;
+            }
+        }
+
+        for p in 0..n {
+            self.load_graph_batch(p, Vec::new(), Vec::new(), true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_graph500_streaming_generated_vertices<F>(
+        &mut self,
+        vertex_count: u64,
+        edges_path: impl AsRef<Path>,
+        mut vertex_value: F,
+        vertex_batch_size: usize,
+        edge_batch_size: usize,
+        undirected: bool,
+    ) -> GeaFlowResult<()>
+    where
+        F: FnMut(u64) -> Vec<u8>,
+    {
+        let n = self.worker_count().max(1);
+        let mut v_bufs: Vec<Vec<(Vec<u8>, Vec<u8>)>> = (0..n).map(|_| Vec::new()).collect();
+        let mut e_bufs: Vec<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> =
+            (0..n).map(|_| Vec::new()).collect();
+
+        for id in 0..vertex_count {
+            let id_bytes = bincode::serialize(&id)
+                .map_err(|e| GeaFlowError::Internal(format!("encode vertex id: {e}")))?;
+            let value_bytes = vertex_value(id);
+            let p = partition_of(&id_bytes, n);
+            v_bufs[p].push((id_bytes, value_bytes));
+            if v_bufs[p].len() >= vertex_batch_size.max(1) {
+                self.load_graph_batch(p, std::mem::take(&mut v_bufs[p]), Vec::new(), false)
+                    .await?;
+            }
+        }
+
+        for p in 0..n {
+            if !v_bufs[p].is_empty() {
+                self.load_graph_batch(p, std::mem::take(&mut v_bufs[p]), Vec::new(), false)
+                    .await?;
+            }
+        }
+
+        let edges_f = std::fs::File::open(edges_path.as_ref())
+            .map_err(|e| GeaFlowError::Internal(format!("open edges: {e}")))?;
+        let edges_r = std::io::BufReader::new(edges_f);
+        let edge_value_bytes = bincode::serialize(&0u8)
+            .map_err(|e| GeaFlowError::Internal(format!("encode edge value: {e}")))?;
+        for line in edges_r.lines() {
+            let line = line.map_err(|e| GeaFlowError::Internal(format!("read edges: {e}")))?;
+            let s = line.trim();
+            if s.is_empty() || s.starts_with('#') {
+                continue;
+            }
+            let mut it = s.split_whitespace();
+            let src: u64 = it
+                .next()
+                .ok_or_else(|| GeaFlowError::InvalidArgument("edge src missing".to_string()))?
+                .parse()
+                .map_err(|e| GeaFlowError::InvalidArgument(format!("edge src parse: {e}")))?;
+            let dst: u64 = it
+                .next()
+                .ok_or_else(|| GeaFlowError::InvalidArgument("edge dst missing".to_string()))?
+                .parse()
+                .map_err(|e| GeaFlowError::InvalidArgument(format!("edge dst parse: {e}")))?;
+            let src_bytes = bincode::serialize(&src)
+                .map_err(|e| GeaFlowError::Internal(format!("encode edge src: {e}")))?;
+            let dst_bytes = bincode::serialize(&dst)
+                .map_err(|e| GeaFlowError::Internal(format!("encode edge dst: {e}")))?;
+
+            {
+                let p = partition_of(&src_bytes, n);
+                e_bufs[p].push((
+                    src_bytes.clone(),
+                    dst_bytes.clone(),
+                    edge_value_bytes.clone(),
+                ));
+                if e_bufs[p].len() >= edge_batch_size.max(1) {
+                    self.load_graph_batch(p, Vec::new(), std::mem::take(&mut e_bufs[p]), false)
+                        .await?;
+                }
+            }
+            if undirected {
+                let p = partition_of(&dst_bytes, n);
+                e_bufs[p].push((dst_bytes, src_bytes, edge_value_bytes.clone()));
+                if e_bufs[p].len() >= edge_batch_size.max(1) {
+                    self.load_graph_batch(p, Vec::new(), std::mem::take(&mut e_bufs[p]), false)
+                        .await?;
+                }
+            }
+        }
+
+        for p in 0..n {
+            if !e_bufs[p].is_empty() {
+                self.load_graph_batch(p, Vec::new(), std::mem::take(&mut e_bufs[p]), false)
+                    .await?;
+            }
+        }
+
+        for p in 0..n {
+            self.load_graph_batch(p, Vec::new(), Vec::new(), true)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn dump_vertices_csv(
+        &mut self,
+        output_dir: impl AsRef<Path>,
+        file_prefix: &str,
+    ) -> GeaFlowResult<Vec<std::path::PathBuf>> {
+        let output_dir = output_dir.as_ref();
+        std::fs::create_dir_all(output_dir).map_err(GeaFlowError::Io)?;
+        let mut out = Vec::with_capacity(self.workers.len());
+
+        for (i, worker) in self.workers.iter_mut().enumerate() {
+            let path = output_dir.join(format!("{file_prefix}_part_{i}.csv"));
+            let path_s = path.to_string_lossy().to_string();
+            send_msg(
+                worker,
+                &DriverToWorker::DumpVerticesCsv {
+                    output_path: path_s.clone(),
+                },
+            )
+            .await?;
+            let resp: WorkerToDriver = recv_msg(worker).await?;
+            match resp {
+                WorkerToDriver::VerticesDumped { .. } => {
+                    out.push(path);
+                }
+                WorkerToDriver::Error { message } => {
+                    return Err(GeaFlowError::Internal(format!("worker error: {message}")));
+                }
+                other => {
+                    return Err(GeaFlowError::Internal(format!(
+                        "unexpected dump response: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub async fn set_algorithm(
