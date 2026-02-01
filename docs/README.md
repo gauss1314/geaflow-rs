@@ -7,3 +7,7 @@ The content under `docs/docs-cn` and `docs/docs-en` was originally written for t
 For the up-to-date Rust runtime usage, see:
 - Chinese: [geaflow-rust/README.md](../geaflow-rust/README.md)
 - English: [geaflow-rust/README_EN.md](../geaflow-rust/README_EN.md)
+
+Product documents:
+- PRD (Chinese): [PRD.md](PRD.md)
+- PRD (English): [PRD_EN.md](PRD_EN.md)
